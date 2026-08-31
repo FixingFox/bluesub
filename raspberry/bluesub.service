@@ -1,0 +1,19 @@
+[Unit]
+Description=Bluesub Raspberry Pi motor/camera controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Filled in by install-service.sh to match the actual clone location
+WorkingDirectory=__APP_DIR__
+ExecStart=__VENV_PYTHON__ __APP_DIR__/main.py
+Restart=always
+RestartSec=2
+# GPIO access requires root (RPi.GPIO)
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

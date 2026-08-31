@@ -25,10 +25,10 @@ FRAME_HEADER_SIZE = struct.calcsize(FRAME_HEADER_FORMAT)
 
 # GPIO Relé-mapping (H-Bridge Par)
 MOTOR_PINS = {
-    1: {"fwd": 5,  "rev": 6},
-    2: {"fwd": 12, "rev": 13},
-    3: {"fwd": 16, "rev": 19},
-    4: {"fwd": 20, "rev": 21}
+    1: {"fwd": 17,  "rev": 22},
+    2: {"fwd": 27, "rev": 23},
+    3: {"fwd": 24, "rev": 5},
+    4: {"fwd": 25, "rev": 6}
 }
 
 # Globale sikkerhets- og kameravariabler
