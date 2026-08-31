@@ -2,6 +2,11 @@ import socket
 import json
 import time
 import threading
+import struct
+import os
+import sys
+import signal
+import atexit
 import cv2
 import RPi.GPIO as GPIO
 
@@ -11,6 +16,12 @@ LAPTOP_IP = "192.168.1.10"
 TCP_PORT = 5000         # Kontroll, Heartbeat og Kamera-kommandoer
 UDP_PORT_CAM1 = 5001    # Kamera 1 Video
 UDP_PORT_CAM2 = 5002    # Kamera 2 Video
+
+PROTOCOL_VERSION = 1
+WATCHDOG_TIMEOUT = float(os.environ.get("BLUESUB_WATCHDOG_TIMEOUT", "0.3"))
+MAX_UDP_PAYLOAD = 60000  # safety margin under the 65507-byte UDP payload limit
+FRAME_HEADER_FORMAT = "!Id"  # sequence number (uint32) + send timestamp (double)
+FRAME_HEADER_SIZE = struct.calcsize(FRAME_HEADER_FORMAT)
 
 # GPIO Relé-mapping (H-Bridge Par)
 MOTOR_PINS = {
@@ -39,7 +50,18 @@ def emergency_stop():
     for motor, pins in MOTOR_PINS.items():
         GPIO.output(pins["fwd"], GPIO.LOW)
         GPIO.output(pins["rev"], GPIO.LOW)
-    print("[FAILSAFE] Nødstopp aktivert: Alle motorer stoppet!")
+
+
+def handle_termination(signum, frame):
+    """Ensure relays de-energize even on SIGTERM (e.g. systemd stop/kill), not just clean exit."""
+    print(f"[SHUTDOWN] Signal {signum} mottatt, kjører nødstopp...")
+    emergency_stop()
+    GPIO.cleanup()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, handle_termination)
+atexit.register(emergency_stop)  # last-resort safety net if the main loop exits unexpectedly
 
 def set_motor_state(motor_id, direction):
     """Sikker motorstyring med programvare-forrigling (Interlock)."""
@@ -61,11 +83,18 @@ def set_motor_state(motor_id, direction):
 # --- SIKKERHETSWATCHDOG ---
 def watchdog_loop():
     global last_heartbeat_time
+    estop_active = False
     while watchdog_running:
-        if time.time() - last_heartbeat_time > 0.3:  # 300 ms timeout
+        elapsed = time.time() - last_heartbeat_time
+        if elapsed > WATCHDOG_TIMEOUT:
+            if not estop_active:
+                print(f"[WATCHDOG] Heartbeat timeout ({elapsed:.2f}s > {WATCHDOG_TIMEOUT}s) - nødstopp aktivert")
+                estop_active = True
             emergency_stop()
-            while time.time() - last_heartbeat_time > 0.3 and watchdog_running:
+            while time.time() - last_heartbeat_time > WATCHDOG_TIMEOUT and watchdog_running:
                 time.sleep(0.1)
+        else:
+            estop_active = False
         time.sleep(0.05)
 
 # --- KONTROLLSERVER (TCP) ---
@@ -103,6 +132,9 @@ def tcp_control_server():
                     try:
                         payload = json.loads(line)
                         p_type = payload.get("type")
+                        p_version = payload.get("v")
+                        if p_version != PROTOCOL_VERSION:
+                            print(f"[WARN] Melding med ukjent protokollversjon '{p_version}', prosesserer likevel")
                         
                         if p_type == "CONTROL":
                             set_motor_state(payload.get("motor"), payload.get("dir"))
@@ -123,6 +155,7 @@ def video_stream_worker(cam_index, port, target_mode_list):
     """Henter og sender video kun når modusen krever det, frigjør hardware ellers."""
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     cap = None
+    seq = 0
     
     print(f"[*] Starter videotråd for Kamera {cam_index} (Venter på aktivering...)")
     
@@ -139,12 +172,18 @@ def video_stream_worker(cam_index, port, target_mode_list):
             start_time = time.time()
             ret, frame = cap.read()
             if ret:
-                ret, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
+                ret, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
                 if ret:
-                    try:
-                        udp_socket.sendto(encoded.tobytes(), (LAPTOP_IP, port))
-                    except socket.error:
-                        pass
+                    header = struct.pack(FRAME_HEADER_FORMAT, seq & 0xFFFFFFFF, time.time())
+                    packet = header + encoded.tobytes()
+                    if len(packet) > MAX_UDP_PAYLOAD:
+                        print(f"[WARN] Kamera {cam_index}: bilde ({len(packet)}B) over UDP-grense, hoppet over")
+                    else:
+                        try:
+                            udp_socket.sendto(packet, (LAPTOP_IP, port))
+                        except socket.error:
+                            pass
+                    seq += 1
             
             elapsed = time.time() - start_time
             sleep_time = max(0.01, 0.05 - elapsed) # ~20 FPS

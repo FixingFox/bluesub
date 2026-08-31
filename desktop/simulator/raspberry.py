@@ -2,6 +2,7 @@ import socket
 import json
 import time
 import threading
+import struct
 import cv2
 import numpy as np
 
@@ -11,6 +12,11 @@ LAPTOP_IP = "127.0.0.1"
 TCP_PORT = 5000         
 UDP_PORT_CAM1 = 5001    
 UDP_PORT_CAM2 = 5002    
+
+PROTOCOL_VERSION = 1
+WATCHDOG_TIMEOUT = 0.3
+MAX_UDP_PAYLOAD = 60000  # safety margin under the 65507-byte UDP payload limit
+FRAME_HEADER_FORMAT = "!Id"  # sequence number (uint32) + send timestamp (double)
 
 # Virtuell tilstand på de 8 reléene (0 = OFF, 1 = HIGH)
 virtual_gpio = {
@@ -56,9 +62,16 @@ def set_motor_state(motor_id, direction):
 # --- WATCHDOG TIMEOUT LØKKE ---
 def watchdog_loop():
     global last_heartbeat_time
+    estop_active = False
     while watchdog_running:
-        if time.time() - last_heartbeat_time > 0.3:
+        elapsed = time.time() - last_heartbeat_time
+        if elapsed > WATCHDOG_TIMEOUT:
+            if not estop_active:
+                print(f"[WATCHDOG] Heartbeat timeout ({elapsed:.2f}s > {WATCHDOG_TIMEOUT}s) - nødstopp aktivert")
+                estop_active = True
             emergency_stop()
+        else:
+            estop_active = False
         time.sleep(0.05)
 
 # --- TCP KOMMANDO MOTTAK ---
@@ -91,6 +104,9 @@ def tcp_control_server():
                     try:
                         payload = json.loads(line)
                         p_type = payload.get("type")
+                        p_version = payload.get("v")
+                        if p_version != PROTOCOL_VERSION:
+                            print(f"[WARN] Melding med ukjent protokollversjon '{p_version}', prosesserer likevel")
                         
                         if p_type == "CONTROL":
                             set_motor_state(payload.get("motor"), payload.get("dir"))
@@ -111,6 +127,7 @@ def synthetic_video_worker(cam_index, port, target_mode_list, color_bg):
     print(f"[SIMULATOR] Videotråd startet for Kamera {cam_index} på port {port}")
     
     frame_count = 0
+    seq = 0
     while watchdog_running:
         if current_camera_mode in target_mode_list:
             start_time = time.time()
@@ -132,12 +149,18 @@ def synthetic_video_worker(cam_index, port, target_mode_list, color_bg):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
             
             # Komprimer til JPEG og send over UDP
-            ret, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
+            ret, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
             if ret:
-                try:
-                    udp_socket.sendto(encoded.tobytes(), (LAPTOP_IP, port))
-                except socket.error:
-                    pass
+                header = struct.pack(FRAME_HEADER_FORMAT, seq & 0xFFFFFFFF, time.time())
+                packet = header + encoded.tobytes()
+                if len(packet) > MAX_UDP_PAYLOAD:
+                    print(f"[WARN] Kamera {cam_index}: bilde ({len(packet)}B) over UDP-grense, hoppet over")
+                else:
+                    try:
+                        udp_socket.sendto(packet, (LAPTOP_IP, port))
+                    except socket.error:
+                        pass
+                seq += 1
             
             elapsed = time.time() - start_time
             time.sleep(max(0.01, 0.05 - elapsed)) # Målrettet ~20 FPS
@@ -156,7 +179,7 @@ def diagnostic_gui():
         cv2.putText(panel, "RPi 4 RELAY MONITOR (LIVE)", (20, 35), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 215, 0), 2)
         
-        is_alive = (time.time() - last_heartbeat_time) < 0.3
+        is_alive = (time.time() - last_heartbeat_time) < WATCHDOG_TIMEOUT
         status_color = (0, 255, 0) if is_alive else (0, 0, 255)
         status_text = "HEARTBEAT: OK" if is_alive else "HEARTBEAT: TIMEOUT (ESTOP)"
         cv2.putText(panel, status_text, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
